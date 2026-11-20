@@ -46,6 +46,7 @@
 
   <!-- 메인 컨테이너 -->
   <main class="max-w-6xl mx-auto px-4 pt-4">
+    <div id="syncBanner" class="hidden mb-3 text-xs rounded-xl px-3 py-2 border"></div>
 
     <!-- 검색창 및 빠른 정렬 바 -->
     <div class="flex flex-col sm:flex-row gap-2 mb-3">
@@ -454,32 +455,79 @@
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    window.onload = function() {
-      loadGames();
+    // ===== Supabase 연결 =====
+    const SB_URL = 'https://nfougbxvbzclveypcepy.supabase.co';
+    const SB_KEY = 'sb_publishable_wavHiww9lx3U78S7_MQuYQ_5gx6LZfL';
+    const LOCAL_GAMES_KEY = 'shelf_games_dataset_v4';
+    let serverOnline = false;
+    let myData = { plays: {}, reviews: {}, dates: {} };
+
+    async function sbFetch(path, options) {
+      const res = await fetch(SB_URL + path, Object.assign({}, options, {
+        headers: Object.assign({ 'apikey': SB_KEY, 'Content-Type': 'application/json' }, (options && options.headers) || {})
+      }));
+      const text = await res.text();
+      let body = null;
+      try { body = text ? JSON.parse(text) : null; } catch (e) { body = text; }
+      if (!res.ok) {
+        const msg = (body && (body.message || body.hint)) || ('HTTP ' + res.status);
+        const err = new Error(msg); err.status = res.status; err.code = body && body.code; throw err;
+      }
+      return body;
+    }
+    function rpc(fn, args) {
+      return sbFetch('/rest/v1/rpc/' + fn, { method: 'POST', body: JSON.stringify(args || {}) });
+    }
+    function memberArgs() { return { p_member: currentUser.id, p_pin: currentUser.pin }; }
+    function errorText(e) {
+      const m = (e && e.message) || '';
+      if (m.includes('wrong_pin')) return '비밀 PIN 번호가 일치하지 않습니다. 다른 사람의 회원번호이거나 PIN을 잘못 입력하셨습니다.';
+      if (m.includes('not_registered')) return '등록되지 않은 회원번호입니다. 다시 로그인해 주세요.';
+      if (m.includes('bad_format')) return '회원번호는 숫자 6자리, PIN은 숫자 4자리여야 합니다.';
+      if (m.includes('Could not find the function') || m.includes('does not exist') || (e && e.status === 404))
+        return '서버 설정이 아직 끝나지 않았습니다. Supabase에서 supabase_setup.sql을 먼저 실행해 주세요.';
+      if (e instanceof TypeError) return '서버에 연결하지 못했습니다. 인터넷 연결을 확인하고 다시 시도해 주세요.';
+      return '저장하지 못했습니다: ' + m;
+    }
+    function setBanner(kind, text) {
+      const el = document.getElementById('syncBanner');
+      if (!kind) { el.classList.add('hidden'); return; }
+      el.className = 'mb-3 text-xs rounded-xl px-3 py-2 border ' + (kind === 'warn'
+        ? 'bg-amber-500/10 border-amber-500/40 text-amber-300'
+        : 'bg-slate-800/60 border-slate-700 text-slate-300');
+      el.textContent = text;
+    }
+    function esc(v) {
+      return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    window.onload = async function() {
+      loadLocalGames();
       loadUser();
       renderBestTabs();
       applyFilters();
+      await refreshGames(true);
+      if (currentUser) await loadMyData();
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && serverOnline) refreshGames(false);
+      });
     };
 
-    function loadGames() {
+    // 이 기기에 저장된 목록 (서버를 못 쓸 때 보여 주는 사본)
+    function loadLocalGames() {
       try {
-        const saved = localStorage.getItem('shelf_games_dataset_v4');
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          // 저장된 데이터가 비어있지 않은 경우에만 사용하고, 비어있으면 INITIAL_GAMES로 자동 복구
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            games = parsed;
-            mergeSeedUpdates();
-          } else {
-            games = INITIAL_GAMES;
-          }
+        const saved = localStorage.getItem(LOCAL_GAMES_KEY);
+        const parsed = saved ? JSON.parse(saved) : null;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          games = parsed;
+          mergeSeedUpdates();
         } else {
-          games = INITIAL_GAMES;
+          games = INITIAL_GAMES.slice();
         }
       } catch(e) {
-        games = INITIAL_GAMES;
+        games = INITIAL_GAMES.slice();
       }
-      document.getElementById('totalCountBadge').innerText = games.length + '개';
+      updateCountBadge();
     }
 
     // 새로 추가된 기본 게임을 이미 저장된 선반에도 한 번만 넣어 준다 (삭제한 게임은 다시 넣지 않음)
@@ -487,24 +535,56 @@
     function mergeSeedUpdates() {
       let seen = 1;
       try { seen = parseInt(localStorage.getItem('shelf_seed_version') || '1', 10) || 1; } catch(e) {}
-      let changed = false;
       SEED_UPDATES.forEach(u => {
         if (u.v <= seen) return;
         u.ids.forEach(id => {
           const g = INITIAL_GAMES.find(x => x.id === id);
-          if (g && !games.some(x => x.id === id || x.name === g.name)) { games.push(g); changed = true; }
+          if (g && !games.some(x => x.id === id || x.name === g.name)) games.push(g);
         });
       });
-      const latest = Math.max(seen, ...SEED_UPDATES.map(u => u.v));
-      try {
-        localStorage.setItem('shelf_seed_version', String(latest));
-        if (changed) localStorage.setItem('shelf_games_dataset_v4', JSON.stringify(games));
-      } catch(e) {}
+      try { localStorage.setItem('shelf_seed_version', String(Math.max(seen, ...SEED_UPDATES.map(u => u.v)))); } catch(e) {}
     }
 
-    function saveGames() {
-      localStorage.setItem('shelf_games_dataset_v4', JSON.stringify(games));
+    function updateCountBadge() {
       document.getElementById('totalCountBadge').innerText = games.length + '개';
+    }
+    function cacheGamesLocally() {
+      try { localStorage.setItem(LOCAL_GAMES_KEY, JSON.stringify(games)); } catch(e) {}
+    }
+
+    // 서버에서 게임 목록을 불러온다. 서버 선반이 비어 있으면 처음 한 번 이 기기 목록으로 채운다.
+    async function refreshGames(firstLoad) {
+      try {
+        let rows = await sbFetch('/rest/v1/games?select=id,data&deleted=eq.false&order=id.asc');
+        if (rows.length === 0 && firstLoad) {
+          const all = await sbFetch('/rest/v1/games?select=id&limit=1');
+          if (all.length === 0) {
+            await rpc('shelf_seed_games', { p_games: games });
+            rows = await sbFetch('/rest/v1/games?select=id,data&deleted=eq.false&order=id.asc');
+          }
+        }
+        games = rows.map(r => Object.assign({}, r.data, { id: r.id }))
+                    .sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+        serverOnline = true;
+        cacheGamesLocally();
+        setBanner(null);
+      } catch (e) {
+        serverOnline = false;
+        setBanner('warn', errorText(e).replace('저장하지 못했습니다: ', '서버 오류: ') + ' 지금은 이 기기에 저장된 목록을 보여 주고 있어요. 수정·기록은 연결된 뒤에 할 수 있어요.');
+      }
+      updateCountBadge();
+      applyFilters();
+    }
+
+    function requireOnline() {
+      if (!serverOnline) { alert('서버에 연결되지 않아 지금은 저장할 수 없습니다. 잠시 후 다시 시도해 주세요.'); return false; }
+      return true;
+    }
+    function requireLogin(msg) {
+      if (currentUser) return true;
+      alert(msg || '먼저 회원번호로 로그인해 주세요.');
+      openLoginModal();
+      return false;
     }
 
     function loadUser() {
@@ -515,18 +595,44 @@
       renderAuthArea();
     }
 
-    function getUserData() {
-      if (!currentUser) return { plays: {}, reviews: {}, dates: {} };
+    async function loadMyData() {
+      if (!currentUser) { myData = { plays: {}, reviews: {}, dates: {} }; return; }
       try {
-        const key = 'shelf_userdata_' + currentUser.id;
-        const d = localStorage.getItem(key);
-        return d ? JSON.parse(d) : { plays: {}, reviews: {}, dates: {} };
-      } catch(e) { return { plays: {}, reviews: {}, dates: {} }; }
+        const d = await rpc('shelf_my_data', memberArgs());
+        myData = { plays: d.plays || {}, reviews: d.reviews || {}, dates: d.dates || {} };
+      } catch (e) {
+        const m = (e && e.message) || '';
+        if (m.includes('wrong_pin') || m.includes('not_registered')) {
+          alert(errorText(e));
+          currentUser = null;
+          localStorage.removeItem('shelf_current_user');
+          renderAuthArea();
+        }
+        myData = { plays: {}, reviews: {}, dates: {} };
+      }
+      applyFilters();
     }
 
-    function saveUserData(data) {
-      if (!currentUser) return;
-      localStorage.setItem('shelf_userdata_' + currentUser.id, JSON.stringify(data));
+    // 예전 버전에서 이 기기에만 저장돼 있던 기록을 서버로 한 번 옮긴다
+    async function importLocalRecords() {
+      const key = 'shelf_userdata_' + currentUser.id;
+      const doneKey = 'shelf_imported_' + currentUser.id;
+      try {
+        if (localStorage.getItem(doneKey)) return 0;
+        const raw = localStorage.getItem(key);
+        if (!raw) return 0;
+        const local = JSON.parse(raw);
+        const hasAny = Object.keys(local.dates || {}).length || Object.keys(local.plays || {}).length || Object.keys(local.reviews || {}).length;
+        if (!hasAny) { localStorage.setItem(doneKey, '1'); return 0; }
+        const n = await rpc('shelf_import_local', Object.assign(memberArgs(), { p_data: local }));
+        localStorage.setItem(doneKey, '1');
+        return n || 0;
+      } catch (e) { return 0; }
+    }
+
+    function getUserData() {
+      if (!currentUser) return { plays: {}, reviews: {}, dates: {} };
+      return myData;
     }
 
     function renderAuthArea() {
@@ -674,10 +780,10 @@
               <div class="flex items-start justify-between gap-2 mb-2">
                 <div class="flex-1 cursor-pointer" onclick="openDetailModal(` + g.id + `)">
                   <div class="flex items-center gap-1.5 flex-wrap mb-1">
-                    <span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">` + g.category + `</span>
-                    <span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-800/80 text-amber-400/90 border border-slate-700">` + g.difficulty + `</span>
+                    <span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">` + esc(g.category) + `</span>
+                    <span class="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-800/80 text-amber-400/90 border border-slate-700">` + esc(g.difficulty) + `</span>
                   </div>
-                  <h3 class="text-base font-bold text-white group-hover:text-amber-400 transition-colors leading-snug">` + g.name + `</h3>
+                  <h3 class="text-base font-bold text-white group-hover:text-amber-400 transition-colors leading-snug">` + esc(g.name) + `</h3>
                 </div>
 
                 <!-- 버튼 그룹 (수정 + 후기) -->
@@ -692,20 +798,20 @@
               </div>
 
               <p class="text-xs text-slate-400 line-clamp-2 mb-3 cursor-pointer" onclick="openDetailModal(` + g.id + `)">
-                ` + summaryText + `
+                ` + esc(summaryText) + `
               </p>
 
               <div class="flex items-center gap-2 flex-wrap text-[11px] mb-3">
-                <span class="bg-slate-800/60 text-slate-300 px-2 py-0.5 rounded-md border border-slate-750">👥 ` + g.players + `</span>
-                <span class="bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-md border border-amber-500/20 font-semibold">★ ` + g.bestPlayers + `</span>
-                <span class="bg-slate-800/60 text-slate-300 px-2 py-0.5 rounded-md border border-slate-750">⏱️ ` + g.time + `</span>
+                <span class="bg-slate-800/60 text-slate-300 px-2 py-0.5 rounded-md border border-slate-750">👥 ` + esc(g.players) + `</span>
+                <span class="bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-md border border-amber-500/20 font-semibold">★ ` + esc(g.bestPlayers) + `</span>
+                <span class="bg-slate-800/60 text-slate-300 px-2 py-0.5 rounded-md border border-slate-750">⏱️ ` + esc(g.time) + `</span>
               </div>
             </div>
 
             <div class="pt-2.5 border-t border-slate-800/80 flex items-center justify-between">
               <div class="flex items-center gap-1.5">
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border ` + tier.badgeBg + `">` + tier.label + `</span>
-                ` + (lastDate ? `<span class="text-[10px] text-slate-500 font-mono hidden sm:inline">(` + lastDate.slice(5, 10) + `)</span>` : '') + `
+                ` + (lastDate ? `<span class="text-[10px] text-slate-500 font-mono hidden sm:inline">(` + esc(lastDate.slice(5, 10)) + `)</span>` : '') + `
               </div>
               <button onclick="triggerPlayCount(` + g.id + `)" class="px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 border border-amber-500/30 text-xs font-bold transition-all active:scale-95">
                 +1 플레이
@@ -716,22 +822,21 @@
       }).join('');
     }
 
-    function triggerPlayCount(gameId) {
-      if (!currentUser) {
-        alert('플레이 횟수를 기록하려면 먼저 회원번호로 로그인해 주세요.');
-        openLoginModal();
-        return;
-      }
-      const data = getUserData();
-      data.plays[gameId] = (data.plays[gameId] || 0) + 1;
-      const now = new Date();
-      const dateStr = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0') + ' ' + String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
-      if (!data.dates[gameId]) data.dates[gameId] = [];
-      data.dates[gameId].push(dateStr);
-      saveUserData(data);
-      applyFilters();
-      if (activeModalGame && activeModalGame.id === gameId) {
-        document.getElementById('modalPlayCountBtn').innerHTML = '<span>+1</span> 플레이 완료 (' + data.plays[gameId] + '회)';
+    async function triggerPlayCount(gameId) {
+      if (!requireLogin('플레이 횟수를 기록하려면 먼저 회원번호로 로그인해 주세요.')) return;
+      if (!requireOnline()) return;
+      try {
+        const dateStr = await rpc('shelf_add_play', Object.assign(memberArgs(), { p_game: gameId }));
+        const data = getUserData();
+        data.plays[gameId] = (data.plays[gameId] || 0) + 1;
+        if (!data.dates[gameId]) data.dates[gameId] = [];
+        data.dates[gameId].push(dateStr);
+        applyFilters();
+        if (activeModalGame && activeModalGame.id === gameId) {
+          document.getElementById('modalPlayCountBtn').innerHTML = '<span>+1</span> 플레이 완료 (' + data.plays[gameId] + '회)';
+        }
+      } catch (e) {
+        alert(errorText(e));
       }
     }
 
@@ -748,10 +853,10 @@
       document.getElementById('modalTime').innerText = g.time;
 
       const setupArr = Array.isArray(g.setup) ? g.setup : (g.setup ? g.setup.split('\n') : ['구성품 세팅']);
-      document.getElementById('modalSetup').innerHTML = setupArr.map(s => '<li class="flex items-start gap-1.5"><span class="text-amber-400">•</span><span>' + s + '</span></li>').join('');
+      document.getElementById('modalSetup').innerHTML = setupArr.map(s => '<li class="flex items-start gap-1.5"><span class="text-amber-400">•</span><span>' + esc(s) + '</span></li>').join('');
 
       const rulesArr = Array.isArray(g.rules) ? g.rules : (g.rules ? g.rules.split('\n') : ['규칙서 참조']);
-      document.getElementById('modalRules').innerHTML = rulesArr.map(r => '<li class="flex items-start gap-1.5"><span class="text-amber-400">▸</span><span>' + r + '</span></li>').join('');
+      document.getElementById('modalRules').innerHTML = rulesArr.map(r => '<li class="flex items-start gap-1.5"><span class="text-amber-400">▸</span><span>' + esc(r) + '</span></li>').join('');
 
       document.getElementById('modalWin').innerText = g.winCondition || '규칙서 참조';
       const tipBox = document.getElementById('modalTipContainer');
@@ -795,6 +900,7 @@
 
     // 게임 규칙/정보 수정 모달
     function openEditModal(gameId) {
+      if (!requireLogin('게임 정보를 수정하려면 먼저 회원번호로 로그인해 주세요.')) return;
       const g = games.find(x => x.id === gameId);
       if (!g) return;
       activeEditGame = g;
@@ -822,8 +928,9 @@
       activeEditGame = null;
     }
 
-    function saveEditGame() {
+    async function saveEditGame() {
       if (!activeEditGame) return;
+      if (!requireOnline()) return;
       const name = document.getElementById('editGameName').value.trim();
       if (!name) {
         alert('게임 이름을 입력해 주세요.');
@@ -836,32 +943,50 @@
       const setupArr = document.getElementById('editGameSetup').value.split('\n').map(s => s.trim()).filter(Boolean);
       const rulesArr = document.getElementById('editGameRules').value.split('\n').map(r => r.trim()).filter(Boolean);
 
-      activeEditGame.name = name;
-      activeEditGame.category = document.getElementById('editGameCategory').value.trim() || '일반';
-      activeEditGame.difficulty = document.getElementById('editGameDiff').value;
-      activeEditGame.minP = minP;
-      activeEditGame.maxP = maxP;
-      activeEditGame.players = minP === maxP ? minP + '인 전용' : minP + '~' + maxP + '인';
-      activeEditGame.time = timeVal + '분';
-      activeEditGame.timeCategory = timeVal <= 20 ? 'short' : (timeVal <= 45 ? 'medium' : 'long');
-      activeEditGame.bestPlayers = document.getElementById('editGameBest').value.trim() || (minP + '~' + maxP + '인');
-      activeEditGame.setup = setupArr.length ? setupArr : ['기본 구성품 세팅'];
-      activeEditGame.rules = rulesArr.length ? rulesArr : ['규칙서 참조'];
-      activeEditGame.summary = rulesArr.length ? rulesArr[0].slice(0, 60) : name;
-      activeEditGame.winCondition = document.getElementById('editGameWin').value.trim();
-      activeEditGame.tips = document.getElementById('editGameTips').value.trim();
+      const updated = Object.assign({}, activeEditGame, {
+        name: name,
+        category: document.getElementById('editGameCategory').value.trim() || '일반',
+        difficulty: document.getElementById('editGameDiff').value,
+        minP: minP,
+        maxP: maxP,
+        players: minP === maxP ? minP + '인 전용' : minP + '~' + maxP + '인',
+        time: timeVal + '분',
+        timeCategory: timeVal <= 20 ? 'short' : (timeVal <= 45 ? 'medium' : 'long'),
+        bestPlayers: document.getElementById('editGameBest').value.trim() || (minP + '~' + maxP + '인'),
+        setup: setupArr.length ? setupArr : ['기본 구성품 세팅'],
+        rules: rulesArr.length ? rulesArr : ['규칙서 참조'],
+        summary: rulesArr.length ? rulesArr[0].slice(0, 60) : name,
+        winCondition: document.getElementById('editGameWin').value.trim(),
+        tips: document.getElementById('editGameTips').value.trim()
+      });
 
-      saveGames();
+      try {
+        await rpc('shelf_save_game', Object.assign(memberArgs(), { p_game: updated }));
+      } catch (e) {
+        alert(errorText(e));
+        return;
+      }
+      Object.assign(activeEditGame, updated);
+      cacheGamesLocally();
       applyFilters();
       closeEditModal();
       alert('[' + name + '] 게임의 정보 및 규칙이 수정되었습니다!');
     }
 
-    function deleteActiveGame() {
+    async function deleteActiveGame() {
       if (!activeEditGame) return;
+      if (!requireOnline()) return;
       if (confirm('[' + activeEditGame.name + '] 게임을 선반에서 정말 삭제하시겠습니까?')) {
-        games = games.filter(g => g.id !== activeEditGame.id);
-        saveGames();
+        const target = activeEditGame;
+        try {
+          await rpc('shelf_delete_game', Object.assign(memberArgs(), { p_game: target.id }));
+        } catch (e) {
+          alert(errorText(e));
+          return;
+        }
+        games = games.filter(g => g.id !== target.id);
+        cacheGamesLocally();
+        updateCountBadge();
         applyFilters();
         closeEditModal();
         alert('게임이 삭제되었습니다.');
@@ -894,7 +1019,7 @@
       } else {
         logList.innerHTML = dateLogs.slice().reverse().map((d, idx) => `
           <div class="flex items-center justify-between py-1 border-b border-slate-800">
-            <span class="font-mono text-slate-300">` + d + `</span>
+            <span class="font-mono text-slate-300">` + esc(d) + `</span>
             <span class="text-[10px] text-amber-400 font-semibold">#` + (dateLogs.length - idx) + `번째 플레이</span>
           </div>
         `).join('');
@@ -915,16 +1040,24 @@
       }
     }
 
-    function saveReview() {
+    async function saveReview() {
       if (!activeReviewGameId || !currentUser) return;
-      const data = getUserData();
-      data.reviews[activeReviewGameId] = {
+      if (!requireOnline()) return;
+      const review = {
         rating: selectedRating,
         members: document.getElementById('reviewMembers').value.trim(),
         note: document.getElementById('reviewText').value.trim()
       };
-      saveUserData(data);
-      alert('후기가 안전하게 저장되었습니다!');
+      try {
+        await rpc('shelf_save_review', Object.assign(memberArgs(), {
+          p_game: activeReviewGameId, p_rating: review.rating, p_members: review.members, p_note: review.note
+        }));
+      } catch (e) {
+        alert(errorText(e));
+        return;
+      }
+      getUserData().reviews[activeReviewGameId] = review;
+      alert('후기가 저장되었습니다!');
       closeReviewModal();
     }
 
@@ -932,36 +1065,34 @@
     function openLoginModal() { document.getElementById('loginModal').classList.remove('hidden'); }
     function closeLoginModal() { document.getElementById('loginModal').classList.add('hidden'); }
 
-    function handleLoginSubmit() {
+    async function handleLoginSubmit() {
       const idInput = document.getElementById('inputUserId').value.trim();
       const pinInput = document.getElementById('inputUserPin').value.trim();
       if (!/^\d{6}$/.test(idInput)) { alert('회원번호는 숫자 6자리를 입력해 주세요.'); return; }
       if (!/^\d{4}$/.test(pinInput)) { alert('보안 PIN은 숫자 4자리를 입력해 주세요.'); return; }
 
-      let accounts = {};
-      try { accounts = JSON.parse(localStorage.getItem('shelf_accounts') || '{}'); } catch(e) { accounts = {}; }
-
-      if (accounts[idInput]) {
-        if (accounts[idInput] !== pinInput) {
-          alert('비밀 PIN 번호가 일치하지 않습니다. 다른 사람의 회원번호이거나 PIN을 잘못 입력하셨습니다.');
-          return;
-        }
-      } else {
-        accounts[idInput] = pinInput;
-        localStorage.setItem('shelf_accounts', JSON.stringify(accounts));
-        alert('회원번호 [' + idInput + '] 계정이 신규 등록되었습니다!');
+      let result;
+      try {
+        result = await rpc('shelf_login', { p_member: idInput, p_pin: pinInput });
+      } catch (e) {
+        alert(errorText(e));
+        return;
       }
-
       currentUser = { id: idInput, pin: pinInput };
       localStorage.setItem('shelf_current_user', JSON.stringify(currentUser));
       renderAuthArea();
       closeLoginModal();
-      applyFilters();
+
+      const imported = await importLocalRecords();
+      await loadMyData();
+      if (result === 'created') alert('회원번호 [' + idInput + '] 계정이 신규 등록되었습니다!');
+      if (imported > 0) alert('이 기기에 저장돼 있던 플레이 기록 ' + imported + '건을 서버로 옮겼습니다. 이제 다른 기기에서도 보입니다.');
     }
 
     function handleLogout() {
       if (confirm('로그아웃 하시겠습니까?')) {
         currentUser = null;
+        myData = { plays: {}, reviews: {}, dates: {} };
         localStorage.removeItem('shelf_current_user');
         renderAuthArea();
         applyFilters();
@@ -998,9 +1129,13 @@
     }
 
     // 새 게임 등록
-    function openAddModal() { document.getElementById('addModal').classList.remove('hidden'); }
+    function openAddModal() {
+      if (!requireLogin('새 게임을 등록하려면 먼저 회원번호로 로그인해 주세요.')) return;
+      document.getElementById('addModal').classList.remove('hidden');
+    }
     function closeAddModal() { document.getElementById('addModal').classList.add('hidden'); }
-    function saveNewGame() {
+    async function saveNewGame() {
+      if (!requireOnline()) return;
       const name = document.getElementById('newGameName').value.trim();
       if (!name) { alert('게임 이름을 입력해 주세요.'); return; }
       const category = document.getElementById('newGameCategory').value.trim() || '일반';
@@ -1030,8 +1165,15 @@
         winCondition: '규칙서 참조',
         tips: ''
       };
+      try {
+        await rpc('shelf_save_game', Object.assign(memberArgs(), { p_game: newGameObj }));
+      } catch (e) {
+        alert(errorText(e));
+        return;
+      }
       games.unshift(newGameObj);
-      saveGames();
+      cacheGamesLocally();
+      updateCountBadge();
       applyFilters();
       closeAddModal();
       alert('[' + name + '] 게임이 추가되었습니다!');
